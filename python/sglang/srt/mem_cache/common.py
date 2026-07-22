@@ -161,12 +161,45 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
 
 
 def evict_from_tree_cache(
-    tree_cache: BasePrefixCache | None, num_tokens: int
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    *,
+    swa_num_tokens: int | None = None,
 ) -> bool | None:
-    if tree_cache is not None and not tree_cache.is_chunk_cache():
-        return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
-            tree_cache, num_tokens
+    if tree_cache is None or tree_cache.is_chunk_cache():
+        return
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    if swa_num_tokens is None:
+        return allocator.evict_to_free_tokens(tree_cache, num_tokens)
+
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+        UnifiedSWATokenToKVPoolAllocator,
+    )
+
+    if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+        return allocator.evict_to_free_tokens(
+            tree_cache, num_tokens, swa_num_tokens=swa_num_tokens
         )
+    if not isinstance(allocator, SWATokenToKVPoolAllocator):
+        return allocator.evict_to_free_tokens(tree_cache, num_tokens)
+
+    while True:
+        full_available_size = allocator.full_available_size()
+        swa_available_size = allocator.swa_available_size()
+        full_shortfall = max(0, num_tokens - full_available_size)
+        swa_shortfall = max(0, swa_num_tokens - swa_available_size)
+        if not full_shortfall and not swa_shortfall:
+            break
+        tree_cache.evict_for_alloc(
+            EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
+        )
+        if (
+            allocator.full_available_size() == full_available_size
+            and allocator.swa_available_size() == swa_available_size
+        ):
+            break
 
 
 def _evict_until_allocatable(
