@@ -206,7 +206,10 @@ class FlexKVRadixCache(RadixCache):
         token_mask[device_len:] = True
 
         fkv_task_id, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids, token_mask=token_mask, handle=req.cache_request_handle
+            token_ids=token_ids,
+            token_mask=token_mask,
+            rid=req.cache_request_handle,
+            sglang_req_id=req.rid,
         )
         if hit <= 0:
             return base_res
@@ -253,7 +256,10 @@ class FlexKVRadixCache(RadixCache):
         # No handle here — IP mode self-pops; pass a synthetic stable key.
         synthetic_handle = CacheRequestHandle(f"_ip_{id(key)}", 0)
         _, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids, token_mask=token_mask, handle=synthetic_handle
+            token_ids=token_ids,
+            token_mask=token_mask,
+            rid=synthetic_handle,
+            sglang_req_id=None,
         )
         if hit <= 0:
             return base_res
@@ -433,6 +439,7 @@ class FlexKVRadixCache(RadixCache):
                     handle=req.cache_request_handle,
                     token_ids=list(token_ids),
                     kv_indices=kv_indices,
+                    sglang_req_id=req.rid,
                 )
         except Exception:  # noqa: BLE001
             self.dec_lock_ref(new_last_node)
@@ -500,7 +507,9 @@ class FlexKVRadixCache(RadixCache):
     ) -> None:
         """Kick off an opportunistic prefetch (SSD/Remote → CPU)."""
         try:
-            self.flexkv_connector.prefetch_async(handle, list(token_ids))
+            self.flexkv_connector.prefetch_async(
+                handle, list(token_ids), sglang_req_id=handle.rid
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
 
