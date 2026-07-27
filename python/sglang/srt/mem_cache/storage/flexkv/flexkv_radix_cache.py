@@ -42,7 +42,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import (
+    FlexKVConnector,
+    FlexKVHostReleaseShim,
+)
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -118,6 +121,9 @@ class FlexKVRadixCache(RadixCache):
             # forward layer blocks on its own eventfd.
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
 
+        # Same hook HiCache uses: scheduler.release_host_resources → destroy().
+        self.token_to_kv_pool_host = FlexKVHostReleaseShim(self.flexkv_connector)
+
         # CUDA streams (mirroring LMCRadixCache).
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
@@ -146,7 +152,9 @@ class FlexKVRadixCache(RadixCache):
             self.flexkv_connector.reset()
 
     def shutdown(self) -> None:
-        if hasattr(self, "flexkv_connector"):
+        if hasattr(self, "token_to_kv_pool_host"):
+            self.token_to_kv_pool_host.destroy()
+        elif hasattr(self, "flexkv_connector"):
             self.flexkv_connector.shutdown()
 
     # ------------------------------------------------------------------
