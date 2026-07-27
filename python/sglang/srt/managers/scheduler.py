@@ -3909,7 +3909,14 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
+        has_uncommitted_restore = getattr(
+            self.tree_cache, "has_uncommitted_restore", None
+        )
+
+        if self.chunked_req is not None and not (
+            has_uncommitted_restore is not None
+            and has_uncommitted_restore(self.chunked_req)
+        ):
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
@@ -3938,6 +3945,13 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # A FlexKV restore owns request-local GPU slots until the previous
+            # batch commits them to the radix cache. Do not rematch the request
+            # in that window: match_prefix would otherwise replace the only
+            # request-side reference before cache completion.
+            if has_uncommitted_restore is not None and has_uncommitted_restore(req):
+                continue
+
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4020,6 +4034,17 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    # A successful storage restore must be followed by batch
+                    # admission in this same pass. Freeing a layerwise restore
+                    # here would race its asynchronous H2D writer, so fail loud
+                    # if a future admission check violates that ordering.
+                    if has_uncommitted_restore is not None and has_uncommitted_restore(
+                        req
+                    ):
+                        raise RuntimeError(
+                            "Request was rejected after storage load-back: "
+                            f"rid={req.rid}"
+                        )
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None
