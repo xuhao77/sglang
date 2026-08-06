@@ -3161,6 +3161,10 @@ class Scheduler(
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
                 )
+        elif get_memory().enable_flexkv:
+            logger.info(f"[FlexKV] sglang startprefetch: request={req.rid}")
+            # Wait-complete FlexKV prefetch: tree_cache owns token selection.
+            self.tree_cache.prefetch_request(req)
 
     def _process_storage_prefetch_retries(self):
         """Issue due L3 attempts in the current waiting-queue order."""
@@ -3977,7 +3981,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or get_memory().enable_flexkv:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
