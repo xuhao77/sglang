@@ -26,6 +26,20 @@ def _flexkv_factory(ctx):
     FlexKV needs them to fan out lookup/store decisions across the full
     TP × CP × PP topology.
     """
+    try:
+        from flexkv.integration.sglang.connector import FlexKVConnector  # noqa: F401
+    except ImportError as exc:
+        try:
+            import flexkv  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "FlexKV is not installed. Please install the FlexKV package "
+                "to use --enable-flexkv."
+            ) from exc
+        raise RuntimeError(
+            f"FlexKV is installed but incompatible version: {exc}."
+        ) from exc
+
     from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import (
         FlexKVRadixCache,
     )
