@@ -79,6 +79,25 @@ class _LoadBackMarker:
 
 
 @dataclass
+class _RestoreLease:
+    """An IP-mode restore whose slots are request-owned until cache commit.
+
+    Only the layerwise (IP) path takes a lease: MP restores are attached to
+    the radix tree inside ``_allocate_and_load``, so tree ownership already
+    protects them and leasing them would stall every MP request.
+
+    ``device_indices`` holds *only* the freshly allocated slots. Any reused
+    tree-owned prefix concatenated onto the returned tensor is excluded, so
+    releasing a lease can never free slots the tree still owns.
+    """
+
+    generation: int
+    rid: str
+    req: Req
+    device_indices: torch.Tensor
+
+
+@dataclass
 class _PendingStoreLaunch:
     """Radix-owned source retained until the deferred D2H launch runs."""
 
@@ -181,6 +200,10 @@ class FlexKVRadixCache(RadixCache):
         )
         self._pending_store_launches: dict[str, _PendingStoreLaunch] = {}
         self._pending_store_copies: dict[str, _PendingStoreCopy] = {}
+        # IP-mode restores that are allocated and being written by the
+        # layerwise H2D engine, but not yet committed to the radix tree.
+        self._restore_leases: dict[str, _RestoreLease] = {}
+        self._restore_generation = 0
         self._node_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -188,7 +211,15 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def reset(self) -> None:  # type: ignore[override]
-        super().reset()
+        # Order matters: FlexKV still holds GPU slot references for in-flight
+        # transfers. Drain it first, then release request-owned restores, and
+        # only then let the base class discard the tree (flush_cache clears the
+        # allocator right after). Freeing first would hand a live D2H source or
+        # layerwise H2D target to whoever allocates next.
+        if hasattr(self, "flexkv_connector"):
+            self.flexkv_connector.reset()
+        if hasattr(self, "_restore_leases"):
+            self._free_uncommitted_restores()
         if hasattr(self, "_load_markers"):
             self._load_markers.clear()
         if hasattr(self, "_inflight_store_nodes"):
@@ -196,8 +227,7 @@ class FlexKVRadixCache(RadixCache):
                 self._inflight_store_nodes.clear()
                 self._pending_store_launches.clear()
                 self._pending_store_copies.clear()
-        if hasattr(self, "flexkv_connector"):
-            self.flexkv_connector.reset()
+        super().reset()
 
     def shutdown(self) -> None:
         if hasattr(self, "token_to_kv_pool_host"):
@@ -479,6 +509,19 @@ class FlexKVRadixCache(RadixCache):
             # cache_finished_req/cache_unfinished_req can free duplicate restores
             # when several concurrent requests load the same host prefix.
             request_owned_req._flexkv_restore_tree_owned_len = value_numel
+            # Lease only the freshly allocated slots: `reused_indices` below is
+            # tree-owned and must never be released by a lease. Key by
+            # tracking_rid, the same rid the load markers and the connector's
+            # pending tables use.
+            self._restore_generation += 1
+            self._restore_leases[tracking_rid] = _RestoreLease(
+                generation=self._restore_generation,
+                rid=tracking_rid,
+                req=request_owned_req,
+                device_indices=fetched_slots,
+            )
+            request_owned_req.pending_restore_generation = self._restore_generation
+            request_owned_req.pending_restore_slots = fetched_slots
             if reused_indices.numel() > 0:
                 fetched_slots = torch.cat([reused_indices, fetched_slots])
             return fetched_slots, last_node
@@ -508,6 +551,71 @@ class FlexKVRadixCache(RadixCache):
         return fetched_slots, new_node
 
     # ------------------------------------------------------------------
+    # IP-mode restore ownership
+    # ------------------------------------------------------------------
+
+    def has_uncommitted_restore(self, req: Req) -> bool:
+        """Whether an IP restore still owns GPU slots outside the radix tree.
+
+        The scheduler uses this to keep such a request out of the waiting-queue
+        rematch: ``init_next_round_input`` reassigns ``req.prefix_indices``,
+        which is the only handle on those slots until cache commit.
+
+        MP restores never take a lease (they are attached to the tree inside
+        ``_allocate_and_load``), so this stays False for them.
+        """
+        # rid is the single-flight key even if a malformed caller creates a
+        # second Req object with the same rid: letting that object start a new
+        # lookup would overwrite connector state owned by the first request.
+        return req.rid in self._restore_leases
+
+    def _commit_restore(self, req: Req) -> None:
+        """Release the lease once the normal cache path has taken ownership."""
+        lease = self._restore_leases.get(req.rid)
+        if lease is None:
+            req._flexkv_uncached_restore = False
+            return
+
+        generation = getattr(req, "pending_restore_generation", None)
+        slots = getattr(req, "pending_restore_slots", None)
+        if (
+            lease.req is not req
+            or generation != lease.generation
+            or slots is not lease.device_indices
+        ):
+            logger.error(
+                "FlexKV restore lease mismatch on commit rid=%s lease_gen=%s req_gen=%s",
+                req.rid,
+                lease.generation,
+                generation,
+            )
+            return
+
+        self._restore_leases.pop(req.rid, None)
+        req._flexkv_uncached_restore = False
+        req.pending_restore_generation = None
+        req.pending_restore_slots = None
+
+    def _free_restore_lease(self, lease: _RestoreLease) -> None:
+        tracked = self._restore_leases.get(lease.rid)
+        if tracked is not lease:
+            raise RuntimeError(
+                "FlexKV restore lease changed before free: "
+                f"rid={lease.rid} generation={lease.generation}"
+            )
+        self.token_to_kv_pool_allocator.free(lease.device_indices)
+        self._restore_leases.pop(lease.rid)
+        lease.req.pending_restore_generation = None
+        lease.req.pending_restore_slots = None
+        lease.req._flexkv_uncached_restore = False
+
+    def _free_uncommitted_restores(self) -> None:
+        """Free every leased restore. Drain the connector before calling this:
+        the layerwise H2D engine must not still be writing into these slots."""
+        for lease in list(self._restore_leases.values()):
+            self._free_restore_lease(lease)
+
+    # ------------------------------------------------------------------
     # cache_finished_req (STORE)
     # ------------------------------------------------------------------
 
@@ -525,7 +633,7 @@ class FlexKVRadixCache(RadixCache):
         super().cache_finished_req(
             req, is_insert=is_insert, owned_kv_len=owned_kv_len
         )
-        req._flexkv_uncached_restore = False
+        self._commit_restore(req)
         if hasattr(req, "_flexkv_restore_tree_owned_len"):
             del req._flexkv_restore_tree_owned_len
         if not is_insert:
@@ -742,7 +850,7 @@ class FlexKVRadixCache(RadixCache):
                 req, "_flexkv_restore_tree_owned_len", req.cache_protected_len
             )
         super().cache_unfinished_req(req, chunked=chunked)
-        req._flexkv_uncached_restore = False
+        self._commit_restore(req)
         if hasattr(req, "_flexkv_restore_tree_owned_len"):
             del req._flexkv_restore_tree_owned_len
 
@@ -755,13 +863,16 @@ class FlexKVRadixCache(RadixCache):
         the source nodes."""
         if self.disable:
             return EvictResult()
-        self._drain_completed_stores()
+        # Eviction is conditional on local allocator pressure, so not every
+        # TP/CP rank calls it. Both store-completion polls are scatter
+        # protocols (sync_ready_store_rids and check_completed_stores), so a
+        # rank that evicts would block in a collective its peers never enter.
+        # They belong to check_hicache_events, which every rank runs each
+        # scheduler tick. In-flight store nodes stay protected by their lock
+        # refs here, so eviction cannot free them anyway.
         # Make sure the store stream's GPU work is observed before any
         # eviction frees the source slots.
         self.store_stream.synchronize()
-        if self._async_store_slot_mapping:
-            self._launch_ready_store_copies()
-            self._drain_completed_stores()
         return super().evict(params)
 
     def check_hicache_events(self) -> None:  # type: ignore[override]
@@ -791,6 +902,17 @@ class FlexKVRadixCache(RadixCache):
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         """Clean up tracking for an aborted request without invoking FlexKV."""
         self._load_markers.pop(handle, None)
+        # Drop the restore lease so an aborted rid cannot keep
+        # has_uncommitted_restore() True forever, which would make the
+        # scheduler skip the request on every pass if it is ever requeued.
+        # The slots themselves are deliberately not freed here: a launched
+        # layerwise H2D may still be writing into them, and an aborted request
+        # releases its KV through the normal release_kv_cache path.
+        lease = self._restore_leases.pop(handle.rid, None)
+        if lease is not None:
+            lease.req.pending_restore_generation = None
+            lease.req.pending_restore_slots = None
+            lease.req._flexkv_uncached_restore = False
         with self._node_lock:
             pending = self._pending_store_launches.pop(handle, None)
             pending_copy = self._pending_store_copies.pop(handle, None)
