@@ -4000,6 +4000,11 @@ class Scheduler(
                 self._prefetch_after_device_hit_loss(req)
             ):
                 continue
+            defer_restore = getattr(
+                self.tree_cache, "should_defer_shared_restore", None
+            )
+            if defer_restore is not None and defer_restore(req):
+                continue
             if (
                 self.enable_hicache_storage
                 and buffer_pipeline is not None
