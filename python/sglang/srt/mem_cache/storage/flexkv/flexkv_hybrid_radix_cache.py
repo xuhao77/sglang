@@ -189,9 +189,12 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             if hasattr(self, "_pending_store_copies"):
                 self._pending_store_copies.clear()
 
-    def shutdown(self) -> None:
-        # Prefer token_to_kv_pool_host.destroy() (HiCache path); keep this alias.
+    def release_host_resources(self) -> None:
         self.token_to_kv_pool_host.destroy()
+        self._inner_cache.release_host_resources()
+
+    def shutdown(self) -> None:
+        self.release_host_resources()
 
     def _release_load_marker(self, handle: CacheRequestHandle) -> None:
         rid = request_key(handle)

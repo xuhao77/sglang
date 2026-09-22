@@ -1,4 +1,4 @@
-"""FlexKV prefetch wiring and pending lookup lifecycle."""
+"""FlexKV cache lifecycle and scheduler integration."""
 
 import importlib.util
 import sys
@@ -140,6 +140,36 @@ def test_completion_releases_only_its_unused_lookup(lookup_cache, completion):
     assert cache._load_markers == {other_rid: other_marker}
     assert cache._inflight_store_nodes == {rid: store_node}
     cache.flexkv_connector.cancel_prefetch.assert_not_called()
+
+
+@pytest.mark.parametrize("entrypoint", ["scheduler", "shutdown"])
+def test_shutdown_releases_flexkv_and_inner_host_resources(lookup_cache, entrypoint):
+    cache = lookup_cache
+    order = []
+    cache.token_to_kv_pool_host = MagicMock()
+    cache.token_to_kv_pool_host.destroy.side_effect = lambda: order.append("flexkv")
+    inner = cache.__dict__.get("_inner_cache")
+    if inner is not None:
+        inner.release_host_resources = MagicMock(
+            side_effect=lambda: order.append("inner")
+        )
+
+    if entrypoint == "shutdown":
+        cache.shutdown()
+    else:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tree_cache = cache
+        scheduler.hisparse_coordinator = None
+        scheduler.decode_offload_manager = None
+        with (
+            patch("sglang.srt.managers.scheduler.destroy_global_experts_capturer"),
+            patch("sglang.srt.managers.scheduler.destroy_global_indexer_capturer"),
+            patch("sglang.srt.managers.scheduler.rank_consensus_checker"),
+        ):
+            scheduler.release_host_resources()
+
+    cache.token_to_kv_pool_host.destroy.assert_called_once()
+    assert order == (["flexkv", "inner"] if inner is not None else ["flexkv"])
 
 
 def test_scheduler_flexkv_prefetch_is_one_liner_to_tree_cache():

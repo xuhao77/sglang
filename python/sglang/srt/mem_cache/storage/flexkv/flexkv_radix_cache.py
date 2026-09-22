@@ -244,11 +244,14 @@ class FlexKVRadixCache(RadixCache):
                 self._pending_store_copies.clear()
         super().reset()
 
-    def shutdown(self) -> None:
+    def release_host_resources(self) -> None:
         if hasattr(self, "token_to_kv_pool_host"):
             self.token_to_kv_pool_host.destroy()
         elif hasattr(self, "flexkv_connector"):
             self.flexkv_connector.shutdown()
+
+    def shutdown(self) -> None:
+        self.release_host_resources()
 
     # ------------------------------------------------------------------
     # match_prefix
