@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -14,14 +15,18 @@ def test_zero_chunk_budget_rejects_before_storage_restore():
     tree_cache.disable = False
     tree_cache.evictable_size.return_value = 0
     tree_cache.is_tree_cache.return_value = False
+    tree_cache.supports_mamba.return_value = False
 
     allocator = MagicMock()
+    allocator.page_size = 4
     allocator.available_size.return_value = 4096
 
     adder = PrefillAdder.__new__(PrefillAdder)
     adder.page_size = 4
     adder.tree_cache = tree_cache
     adder.token_to_kv_pool_allocator = allocator
+    adder.memory_budget = PrefillBudget(allocator, tree_cache)
+    adder.exact_chunk_fill = False
     adder.running_batch = None
     adder.prefill_delayer_single_pass = None
     adder.dsa_prefill_cp_in_seq_split = False
@@ -44,6 +49,7 @@ def test_zero_chunk_budget_rejects_before_storage_restore():
         full_untruncated_fill_ids=list(range(12)),
         prefix_indices=torch.arange(4, dtype=torch.int64),
         host_hit_length=4,
+        swa_host_hit_length=0,
         last_node=object(),
         retracted_stain=False,
         needs_host_load_back=lambda: True,

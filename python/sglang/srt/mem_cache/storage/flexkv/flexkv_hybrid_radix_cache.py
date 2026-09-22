@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
+from flexkv.integration.sglang.connector import (
+    FlexKVConnector,
+    FlexKVHostReleaseShim,
+)
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -18,6 +22,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
     DecLockRefParams,
     EvictParams,
     EvictResult,
@@ -27,10 +32,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from flexkv.integration.sglang.connector import (
-    FlexKVConnector,
-    FlexKVHostReleaseShim,
-)
+from sglang.srt.mem_cache.storage.flexkv.utils import request_key
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -207,16 +209,17 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
         token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
         token_mask[device_length:] = True
+        rid = request_key(params.req.cache_request_handle)
         _, hit_length = self.flexkv_connector.lookup_kv(
             token_ids,
             token_mask,
-            rid=params.req.rid,
+            rid=rid,
             sglang_req_id=params.req.rid,
         )
         if hit_length <= 0:
             return result
 
-        self._load_markers[params.req.rid] = _LoadMarker(
+        self._load_markers[rid] = _LoadMarker(
             device_length=device_length,
         )
         return result._replace(
@@ -228,17 +231,18 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, Any]:
         req = params.req
-        if req.rid in self._restore_leases:
+        rid = request_key(req.cache_request_handle)
+        if rid in self._restore_leases:
             raise RuntimeError(f"FlexKV load-back before restore commit: rid={req.rid}")
 
-        marker = self._load_markers.pop(req.rid, None)
+        marker = self._load_markers.pop(rid, None)
         if marker is None or params.host_hit_length <= 0:
-            self.flexkv_connector.release_pending(req.rid)
+            self.flexkv_connector.release_pending(rid)
             return self._empty_indices(), req.last_node
 
         device_indices = self._alloc_restore_slots(req, params.host_hit_length)
         if device_indices is None:
-            self.flexkv_connector.release_pending(req.rid)
+            self.flexkv_connector.release_pending(rid)
             return self._empty_indices(), req.last_node
 
         # Register ownership before launching the connector. If launch raises,
@@ -248,20 +252,20 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._restore_generation += 1
         lease = _RestoreLease(
             generation=generation,
-            rid=req.rid,
+            rid=rid,
             req=req,
             device_indices=device_indices,
         )
-        self._restore_leases[req.rid] = lease
+        self._restore_leases[rid] = lease
         req.pending_restore_generation = generation
         req.pending_restore_slots = device_indices
 
         if self.flexkv_connector.enable_layerwise:
             loaded, _ = self.flexkv_connector.start_load_kv_layerwise(
-                req.rid, device_indices
+                rid, device_indices
             )
         else:
-            loaded = self.flexkv_connector.retrieve_kv(req.rid, device_indices)
+            loaded = self.flexkv_connector.retrieve_kv(rid, device_indices)
 
         # Admission planning uses the lookup hit length. Keep load-back
         # all-or-nothing so a successful restore cannot invalidate the checks
@@ -295,12 +299,12 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # The restored tail is request-owned until the normal cache completion
         # path inserts it. Preserve the pre-restore protection boundary so the
         # inner cache can deduplicate or free every restored slot correctly.
-        req.cache_protected_len = marker.device_length
+        req.kv.cache_protected_len = marker.device_length
         req._flexkv_uncached_restore = True
         return device_indices, req.last_node
 
     def has_uncommitted_restore(self, req: Req) -> bool:
-        return req.rid in self._restore_leases
+        return request_key(req.cache_request_handle) in self._restore_leases
 
     @staticmethod
     def _restore_lease_matches_req(req: Req, lease: _RestoreLease) -> bool:
@@ -311,7 +315,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         )
 
     def _validate_restore_lease(self, req: Req) -> Optional[_RestoreLease]:
-        lease = self._restore_leases.get(req.rid)
+        lease = self._restore_leases.get(request_key(req.cache_request_handle))
         if lease is None or lease.req is not req:
             # An older aborted Req may finish after a new Req reused its rid.
             # Find by object identity, never commit the successor's lease.
@@ -470,12 +474,15 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             host_hit_length,
         )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
+    ) -> None:
         self._validate_restore_lease(req)
         self._apply_restore_swa_boundary(req)
-        kv_length = int(kwargs.get("kv_len_to_handle", req.kv_committed_len))
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_length]
-        self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
+        self._inner_cache.cache_finished_req(
+            req, is_insert=is_insert, owned_kv_len=owned_kv_len, **kwargs
+        )
         self._commit_restore(req)
         if not is_insert:
             return
@@ -532,7 +539,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         match = self._inner_cache.match_prefix(MatchPrefixParams(key=key))
         node = match.last_device_node
         indices = match.device_indices
-        if node is self._inner_cache.root_node or indices.numel() == 0:
+        if self._inner_cache.is_root(node) or indices.numel() == 0:
             return
         if indices.numel() < len(token_ids):
             token_ids = token_ids[: indices.numel()]
@@ -650,8 +657,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             pending_copy = self._pending_store_copies.pop(store_key, None)
             if pending_copy is None:
                 raise RuntimeError(
-                    "FlexKV async store-ready key is not locally pending: "
-                    f"{store_key}"
+                    f"FlexKV async store-ready key is not locally pending: {store_key}"
                 )
             pending = pending_copy.launch
             indices = (
@@ -703,8 +709,14 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         del req._flexkv_swa_evicted_seqlen
 
     def evict(self, params: EvictParams) -> EvictResult:
-        self._drain_completed_stores()
+        # Local memory pressure can make eviction asymmetric across TP/CP
+        # ranks. Do not poll FlexKV here: completion uses a cross-rank scatter
+        # and belongs to the synchronized scheduler hook below. The inner
+        # cache cannot evict active store nodes because their lock refs remain.
         return self._inner_cache.evict(params)
+
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        return self._inner_cache.evict_for_alloc(params)
 
     def check_hicache_events(self) -> None:
         self._drain_completed_stores()
@@ -722,7 +734,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                     node, dec_params = tracked
                     self._inner_cache.dec_lock_ref(node, dec_params)
 
-    def release_aborted_request(self, rid: str) -> None:
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        rid = request_key(handle)
         self._load_markers.pop(rid, None)
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
@@ -736,18 +749,18 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # release through cache_finished_req; orphaned allocations await an idle
         # flush, whose connector reset fences H2D before freeing them.
 
-    def prefetch_request(self, req: "Req") -> None:
+    def prefetch_request(self, req: Req) -> None:
         """Wait-complete FlexKV prefetch; see FlexKVRadixCache.prefetch_request."""
         req.init_next_round_input(tree_cache=None, cow_mamba=False)
         fill_ids = req.full_untruncated_fill_ids
         if not fill_ids:
             return
         match_end = req._compute_max_prefix_len(len(fill_ids))
-        self.prefetch_from_storage(req.rid, None, fill_ids[:match_end])
+        self.prefetch_from_storage(req.cache_request_handle, None, fill_ids[:match_end])
 
     def prefetch_from_storage(
         self,
-        rid: str,
+        handle: CacheRequestHandle,
         last_host_node: Any = None,
         token_ids=None,
         last_hash=None,
@@ -762,20 +775,45 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             ids = ids[:aligned]
         if not ids:
             return
-        self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
+        self.flexkv_connector.prefetch_async(
+            request_key(handle), ids, sglang_req_id=handle.rid
+        )
 
-    def check_prefetch_progress(self, rid: str) -> bool:
-        return self.flexkv_connector.check_prefetch_progress(rid)
+    def check_prefetch_progress(self, handle: CacheRequestHandle) -> bool:
+        return self.flexkv_connector.check_prefetch_progress(request_key(handle))
 
-    def terminate_prefetch(self, rid: str) -> None:
-        self.flexkv_connector.cancel_prefetch(rid)
+    def terminate_prefetch(self, handle: CacheRequestHandle) -> None:
+        self.flexkv_connector.cancel_prefetch(request_key(handle))
 
-    def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+    def pop_prefetch_loaded_tokens(self, handle: CacheRequestHandle) -> int:
         pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
         if callable(pop):
-            return int(pop(rid))
-        del rid
+            return int(pop(request_key(handle)))
         return 0
+
+    def resolve_node_handle(self, node_handle: Any) -> Any:
+        return self._inner_cache.resolve_node_handle(node_handle)
+
+    def root_node_handle(self, extra_key: Optional[str] = None) -> Any:
+        return self._inner_cache.root_node_handle(extra_key)
+
+    def is_backuped(self, node: Any) -> bool:
+        return self._inner_cache.is_backuped(node)
+
+    def is_root(self, node: Any) -> bool:
+        return self._inner_cache.is_root(node)
+
+    def get_last_hash_value(self, node: Any) -> Optional[str]:
+        return self._inner_cache.get_last_hash_value(node)
+
+    def get_prefix_hash_values(self, node: Any) -> list[str]:
+        return self._inner_cache.get_prefix_hash_values(node)
+
+    def rotation_base_of(self, node: Any) -> Optional[int]:
+        return self._inner_cache.rotation_base_of(node)
+
+    def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
+        return self._inner_cache.dfs_weight_order(node_handles)
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         return self._inner_cache.inc_lock_ref(node)
@@ -813,6 +851,12 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def swa_protected_size(self) -> int:
         return self._inner_cache.swa_protected_size()
+
+    def swa_transient_size(self) -> int:
+        return self._inner_cache.swa_transient_size()
+
+    def swa_retain_floor(self, req: Req) -> Optional[int]:
+        return self._inner_cache.swa_retain_floor(req)
 
     def total_size(self) -> int:
         return self._inner_cache.total_size()

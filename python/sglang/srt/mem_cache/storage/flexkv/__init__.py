@@ -67,7 +67,7 @@ def _flexkv_factory(ctx):
     # fall back to 0 for single-rank dims.
     pp_rank = pp_group.rank_in_group if pp_group is not None else 0
     attn_cp_rank = attn_cp_group.rank_in_group if attn_cp_group is not None else 0
-    parallel_state = getattr(ctx.tp_worker, "ps", None)
+    parallel_state = get_parallel()
     if server_args.enable_dp_attention:
         dp_rank = getattr(parallel_state, "attn_dp_rank", 0)
     else:
@@ -94,7 +94,7 @@ def _flexkv_factory(ctx):
         from sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache import (
             FlexKVHybridRadixCache,
         )
-        from sglang.srt.mem_cache.unified_cache_components import ComponentType
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         ctx.params.tree_components = (ComponentType.FULL, ComponentType.SWA)

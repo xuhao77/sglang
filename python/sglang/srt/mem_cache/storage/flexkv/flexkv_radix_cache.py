@@ -37,6 +37,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
+from flexkv.integration.sglang.connector import (
+    FlexKVConnector,
+    FlexKVHostReleaseShim,
+)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -47,10 +51,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from flexkv.integration.sglang.connector import (
-    FlexKVConnector,
-    FlexKVHostReleaseShim,
-)
+from sglang.srt.mem_cache.storage.flexkv.utils import request_key
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -104,6 +105,7 @@ class _PendingStoreLaunch:
     node: TreeNode
     token_ids: list[int]
     kv_indices: torch.Tensor
+    sglang_req_id: str
 
 
 @dataclass
@@ -113,6 +115,7 @@ class _PendingStoreCopy:
     node: TreeNode
     token_ids: list[int]
     kv_indices: torch.Tensor
+    sglang_req_id: str
     cpu_indices: Optional[torch.Tensor]
     ready_event: Optional[torch.cuda.Event]
 
@@ -174,7 +177,7 @@ class FlexKVRadixCache(RadixCache):
 
         # Two-phase MP load: stash marker between ``match_prefix`` and
         # ``init_load_back``.
-        self._load_markers: dict[CacheRequestHandle, _LoadBackMarker] = {}
+        self._load_markers: dict[str, _LoadBackMarker] = {}
         self._defer_duplicate_restores = os.environ.get(
             "FLEXKV_DEFER_DUPLICATE_RESTORES", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
@@ -183,7 +186,7 @@ class FlexKVRadixCache(RadixCache):
         # ``store_kv`` is async — we keep a lock on the source node until
         # FlexKV signals completion at the scheduler's synchronized
         # ``check_hicache_events`` point.
-        self._inflight_store_nodes: dict[CacheRequestHandle, TreeNode] = {}
+        self._inflight_store_nodes: dict[str, TreeNode] = {}
         self._profile_store_stages = os.getenv(
             "FLEXKV_PROFILE_STORE_STAGES", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -311,7 +314,7 @@ class FlexKVRadixCache(RadixCache):
         fkv_task_id, hit = self.flexkv_connector.lookup_kv(
             token_ids=token_ids,
             token_mask=token_mask,
-            rid=req.cache_request_handle,
+            rid=request_key(req.cache_request_handle),
             sglang_req_id=req.rid,
         )
         if hit <= 0:
@@ -322,7 +325,7 @@ class FlexKVRadixCache(RadixCache):
             token_ids_snap = token_ids[:]
         else:
             token_ids_snap = token_ids
-        self._load_markers[req.cache_request_handle] = _LoadBackMarker(
+        self._load_markers[request_key(req.cache_request_handle)] = _LoadBackMarker(
             key=RadixKey(
                 token_ids_snap,
                 key.extra_key,
@@ -382,18 +385,19 @@ class FlexKVRadixCache(RadixCache):
             return False
         if req.kv.holds_mamba:
             return False
-        marker = self._load_markers.get(req.rid)
+        rid = request_key(req.cache_request_handle)
+        marker = self._load_markers.get(rid)
         if marker is None:
             return False
         end = min(marker.value_numel + req.host_hit_length, len(marker.key))
         key = self._restore_prefix_key(marker.key, end)
         owner = self._restoring_host_prefixes.get(key)
-        if owner is None or owner == req.rid:
+        if owner is None or owner == rid:
             return False
         # This lookup will not launch: the next admission rematches the prefix.
         # Cancel it now, before a later lookup can overwrite its held task id.
-        self.flexkv_connector.release_pending(req.rid)
-        self._load_markers.pop(req.rid, None)
+        self.flexkv_connector.release_pending(rid)
+        self._load_markers.pop(rid, None)
         return True
 
     def _release_restore_prefix(self, rid: str) -> None:
@@ -411,12 +415,13 @@ class FlexKVRadixCache(RadixCache):
         if self.has_uncommitted_restore(req):
             raise RuntimeError(f"FlexKV load-back before restore commit: rid={req.rid}")
         last_node: TreeNode = params.best_match_node
-        marker = self._load_markers.pop(req.cache_request_handle, None)
+        rid = request_key(req.cache_request_handle)
+        marker = self._load_markers.pop(rid, None)
         if marker is None:
             # ``match_prefix`` decided there was no work to do, but the
             # scheduler still called us. Release any held task and
             # return an empty load.
-            self.flexkv_connector.release_pending(req.cache_request_handle)
+            self.flexkv_connector.release_pending(rid)
             return (
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
@@ -426,13 +431,13 @@ class FlexKVRadixCache(RadixCache):
         load_fn = (
             (
                 lambda slot_mapping: self.flexkv_connector.start_load_kv_layerwise(
-                    req.cache_request_handle, slot_mapping
+                    rid, slot_mapping
                 )[0]
             )
             if self._mode is FlexKVMode.IP
             else (
                 lambda slot_mapping: self.flexkv_connector.retrieve_kv(
-                    req.cache_request_handle, slot_mapping
+                    rid, slot_mapping
                 )
             )
         )
@@ -441,7 +446,7 @@ class FlexKVRadixCache(RadixCache):
             value_numel=marker.value_numel,
             uncached_len=params.host_hit_length,
             last_node=last_node,
-            tracking_rid=req.cache_request_handle,
+            tracking_rid=rid,
             sglang_req_id=req.rid,
             load_fn=load_fn,
             request_owned_req=request_owned_req,
@@ -451,7 +456,7 @@ class FlexKVRadixCache(RadixCache):
             # already cancels/cleans up on failure paths; release_pending
             # is idempotent for the case where allocation failed before
             # we even popped the held task.
-            self.flexkv_connector.release_pending(req.cache_request_handle)
+            self.flexkv_connector.release_pending(rid)
             return (
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
@@ -590,7 +595,7 @@ class FlexKVRadixCache(RadixCache):
                 self._restore_prefix_by_rid[tracking_rid] = prefix_key
             # Normal request completion inserts these slots into the radix tree.
             # Until then they have exactly one owner: the request cleanup path.
-            request_owned_req.cache_protected_len = value_numel
+            request_owned_req.kv.cache_protected_len = value_numel
             request_owned_req._flexkv_uncached_restore = True
             # SchedulePolicy sets cache_protected_len to the complete restored
             # prefix after init_load_back.  That is correct for accounting while
@@ -633,7 +638,7 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def has_uncommitted_restore(self, req: Req) -> bool:
-        return req.rid in self._restore_leases
+        return request_key(req.cache_request_handle) in self._restore_leases
 
     @staticmethod
     def _restore_lease_matches_req(req: Req, lease: _RestoreLease) -> bool:
@@ -644,7 +649,7 @@ class FlexKVRadixCache(RadixCache):
         )
 
     def _validate_restore_lease(self, req: Req) -> Optional[_RestoreLease]:
-        lease = self._restore_leases.get(req.rid)
+        lease = self._restore_leases.get(request_key(req.cache_request_handle))
         if lease is None or lease.req is not req:
             # An older aborted Req may finish after a new Req reused its rid.
             # Find by object identity, never commit the successor's lease.
@@ -711,26 +716,25 @@ class FlexKVRadixCache(RadixCache):
         self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ) -> None:
         """Base cache_finished_req then fire an async FlexKV store."""
+        rid = request_key(req.cache_request_handle)
         self._validate_restore_lease(req)
         if getattr(req, "_flexkv_uncached_restore", False):
             # Restored IP/layerwise slots are request-owned until this insertion.
             # SchedulePolicy temporarily counts them as protected, so restore the
             # pre-load tree-owned boundary before RadixCache handles duplicates.
-            req.cache_protected_len = getattr(
-                req, "_flexkv_restore_tree_owned_len", req.cache_protected_len
+            req.kv.cache_protected_len = getattr(
+                req, "_flexkv_restore_tree_owned_len", req.kv.cache_protected_len
             )
-        super().cache_finished_req(
-            req, is_insert=is_insert, owned_kv_len=owned_kv_len
-        )
+        super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
         self._commit_restore(req)
         # Late cleanup of an aborted Req must not release a new producer
         # that reused its rid while the old allocation was retained.
         if not self.has_uncommitted_restore(req):
-            self._release_restore_prefix(req.rid)
+            self._release_restore_prefix(rid)
         if hasattr(req, "_flexkv_restore_tree_owned_len"):
             del req._flexkv_restore_tree_owned_len
         if not is_insert:
-            self._load_markers.pop(req.cache_request_handle, None)
+            self._load_markers.pop(rid, None)
             return
 
         # Compute the committed prefix mirroring LMCRadixCache's logic.
@@ -780,23 +784,22 @@ class FlexKVRadixCache(RadixCache):
         if self._async_store_slot_mapping:
             with self._node_lock:
                 if (
-                    req.cache_request_handle in self._pending_store_launches
-                    or req.cache_request_handle in self._inflight_store_nodes
+                    rid in self._pending_store_launches
+                    or rid in self._inflight_store_nodes
                 ):
                     self.dec_lock_ref(new_last_node)
-                    raise RuntimeError(
-                        f"FlexKV duplicate pending store rid={req.rid}"
-                    )
-                self._pending_store_launches[req.cache_request_handle] = _PendingStoreLaunch(
+                    raise RuntimeError(f"FlexKV duplicate pending store rid={req.rid}")
+                self._pending_store_launches[rid] = _PendingStoreLaunch(
                     node=new_last_node,
                     token_ids=list(token_ids),
                     kv_indices=kv_indices,
+                    sglang_req_id=req.rid,
                 )
             return
 
         try:
             fkv_task_id = self._launch_store(
-                req.cache_request_handle, list(token_ids), kv_indices
+                rid, list(token_ids), kv_indices, sglang_req_id=req.rid
             )
         except Exception:  # noqa: BLE001
             self.dec_lock_ref(new_last_node)
@@ -809,7 +812,7 @@ class FlexKVRadixCache(RadixCache):
             return
 
         with self._node_lock:
-            self._inflight_store_nodes[req.cache_request_handle] = new_last_node
+            self._inflight_store_nodes[rid] = new_last_node
 
     def _launch_store(
         self,
@@ -817,6 +820,7 @@ class FlexKVRadixCache(RadixCache):
         token_ids: list[int],
         kv_indices: torch.Tensor,
         *,
+        sglang_req_id: str,
         mapping_already_on_cpu: bool = False,
         skip_mapping_validation: bool = False,
     ) -> int:
@@ -849,7 +853,7 @@ class FlexKVRadixCache(RadixCache):
                     rid=rid,
                     token_ids=token_ids,
                     kv_indices=kv_indices,
-                    sglang_req_id=rid,
+                    sglang_req_id=sglang_req_id,
                 )
 
     def _store_profile_scope(self, name: str):
@@ -878,6 +882,7 @@ class FlexKVRadixCache(RadixCache):
             node=pending.node,
             token_ids=pending.token_ids,
             kv_indices=pending.kv_indices,
+            sglang_req_id=pending.sglang_req_id,
             cpu_indices=cpu_indices,
             ready_event=ready_event,
         )
@@ -908,6 +913,7 @@ class FlexKVRadixCache(RadixCache):
                         rid,
                         pending.token_ids,
                         store_indices,
+                        sglang_req_id=pending.sglang_req_id,
                         mapping_already_on_cpu=pending.cpu_indices is not None,
                         skip_mapping_validation=pending.cpu_indices is None,
                     )
@@ -940,15 +946,15 @@ class FlexKVRadixCache(RadixCache):
     ) -> None:
         self._validate_restore_lease(req)
         if getattr(req, "_flexkv_uncached_restore", False):
-            req.cache_protected_len = getattr(
-                req, "_flexkv_restore_tree_owned_len", req.cache_protected_len
+            req.kv.cache_protected_len = getattr(
+                req, "_flexkv_restore_tree_owned_len", req.kv.cache_protected_len
             )
         super().cache_unfinished_req(req, chunked=chunked)
         self._commit_restore(req)
         # Late cleanup of an aborted Req must not release a new producer
         # that reused its rid while the old allocation was retained.
         if not self.has_uncommitted_restore(req):
-            self._release_restore_prefix(req.rid)
+            self._release_restore_prefix(request_key(req.cache_request_handle))
         if hasattr(req, "_flexkv_restore_tree_owned_len"):
             del req._flexkv_restore_tree_owned_len
 
@@ -999,11 +1005,11 @@ class FlexKVRadixCache(RadixCache):
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         """Release admission tracking without polling launched transfers."""
-        rid = handle.rid
+        rid = request_key(handle)
         # Stop waiting for an aborted producer. Its allocation remains
         # tracked separately while waiters allocate their own slots.
         self._release_restore_prefix(rid)
-        self._load_markers.pop(handle, None)
+        self._load_markers.pop(rid, None)
         # Queue-limit/timeout aborts can finish without cache_finished_req.
         # Remove the scheduling guard, but keep a separate allocation ledger:
         # dropping the only slot record would leak such pre-admission restores.
@@ -1014,19 +1020,19 @@ class FlexKVRadixCache(RadixCache):
         # release through cache_finished_req; orphaned allocations await an idle
         # flush, whose connector reset fences H2D before freeing them.
         with self._node_lock:
-            pending = self._pending_store_launches.pop(handle, None)
-            pending_copy = self._pending_store_copies.pop(handle, None)
-            node = self._inflight_store_nodes.pop(handle, None)
+            pending = self._pending_store_launches.pop(rid, None)
+            pending_copy = self._pending_store_copies.pop(rid, None)
+            node = self._inflight_store_nodes.pop(rid, None)
         if pending is not None:
             self.dec_lock_ref(pending.node)
         if pending_copy is not None:
             self.dec_lock_ref(pending_copy.node)
         if node is not None:
             self.dec_lock_ref(node)
-        self.flexkv_connector.release_pending(handle)
-        self.flexkv_connector.cancel_prefetch(handle)
+        self.flexkv_connector.release_pending(rid)
+        self.flexkv_connector.cancel_prefetch(rid)
 
-    def prefetch_request(self, req: "Req") -> None:
+    def prefetch_request(self, req: Req) -> None:
         """Wait-complete FlexKV prefetch for a queued request.
 
         Owns fill-id refresh / page alignment so the scheduler only needs
@@ -1065,21 +1071,21 @@ class FlexKVRadixCache(RadixCache):
             return
         try:
             self.flexkv_connector.prefetch_async(
-                handle, ids, sglang_req_id=handle.rid
+                request_key(handle), ids, sglang_req_id=handle.rid
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
 
     def check_prefetch_progress(self, handle: CacheRequestHandle) -> bool:
-        return self.flexkv_connector.check_prefetch_progress(handle)
+        return self.flexkv_connector.check_prefetch_progress(request_key(handle))
 
     def terminate_prefetch(self, handle: CacheRequestHandle) -> None:
-        self.flexkv_connector.cancel_prefetch(handle)
+        self.flexkv_connector.cancel_prefetch(request_key(handle))
 
     def pop_prefetch_loaded_tokens(self, handle: CacheRequestHandle) -> int:
         pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
         if callable(pop):
-            return int(pop(handle))
+            return int(pop(request_key(handle)))
         # Older FlexKV builds do not track the materialized REMOTE2H prefix.
         # Reporting 0 attributes the whole hit to the host tier, which only
         # skews the #cached-host / #cached-storage split in the logs.
