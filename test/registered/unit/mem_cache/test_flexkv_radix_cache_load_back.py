@@ -261,9 +261,7 @@ def test_reset_drains_flexkv_before_freeing_leased_restore_slots():
     assert cache._restore_leases == {}
 
 
-def test_short_mp_restore_keeps_the_loaded_prefix():
-    """MP retrieve_kv is synchronous, so the unused tail is idle and the
-    partially loaded prefix is safe to keep."""
+def test_short_mp_restore_discards_all_fresh_slots():
     cache, allocator = _make_cache()
 
     result = cache._allocate_and_load(
@@ -276,11 +274,11 @@ def test_short_mp_restore_keeps_the_loaded_prefix():
         load_fn=MagicMock(return_value=4),
     )
 
-    assert result is not None
-    restored, _node = result
-    assert restored.numel() == 4
+    assert result is None
     freed = torch.cat([call.args[0] for call in allocator.free.call_args_list])
-    assert freed.numel() == 4  # only the unused tail
+    assert torch.equal(freed, torch.arange(100, 108))
+    assert cache.root_node.children == {}
+    assert cache.evictable_size() == 0
 
 
 def test_partial_duplicate_restore_relooks_up_only_missing_suffix():
@@ -307,7 +305,7 @@ def test_partial_duplicate_restore_relooks_up_only_missing_suffix():
     assert torch.equal(match.device_indices, restored_indices)
 
 
-def test_partial_duplicate_restore_keeps_reused_prefix_when_alloc_fails():
+def test_partial_duplicate_restore_falls_back_when_alloc_fails():
     cache, allocator = _make_cache()
     first_page = RadixKey(array("q", range(4)))
     full_key = RadixKey(array("q", range(8)))
@@ -317,13 +315,119 @@ def test_partial_duplicate_restore_keeps_reused_prefix_when_alloc_fails():
     allocator.alloc.side_effect = None
     allocator.alloc.return_value = None
 
-    (restored_indices, last_node), second_load = _load(cache, full_key, 0, 8, "second")
+    second_load = MagicMock()
+    result = cache._allocate_and_load(
+        key=full_key,
+        value_numel=0,
+        uncached_len=8,
+        last_node=cache.root_node,
+        tracking_rid="second",
+        sglang_req_id="second",
+        load_fn=second_load,
+    )
 
     second_load.assert_not_called()
-    assert torch.equal(restored_indices, first_indices)
-    assert last_node is first_node
+    assert result is None
+    match = RadixCache.match_prefix(cache, MatchPrefixParams(key=full_key))
+    assert torch.equal(match.device_indices, first_indices)
+    assert match.last_device_node is first_node
     assert cache.evictable_leaves == {first_node}
     assert cache.evictable_size() == 4
+
+
+@pytest.mark.parametrize("mode", ["MP", "IP"])
+@pytest.mark.parametrize("remaining_hit", [0, 4])
+def test_relookup_shortfall_does_not_launch_a_partial_restore(mode, remaining_hit):
+    cache, allocator = _make_cache()
+    cache._mode = cache.match_prefix.__globals__["FlexKVMode"][mode]
+    key = RadixKey(array("q", range(12)))
+    req = _TestReq(rid="waiting", kv=SimpleNamespace(cache_protected_len=0))
+    cache.flexkv_connector.lookup_kv.return_value = (17, 12)
+    match = cache.match_prefix(MatchPrefixParams(key=key, req=req))
+    req.prefix_indices = match.device_indices
+    req.last_node = match.last_device_node
+    (reused, reused_node), _ = _load(cache, key[:4], 0, 4, "other")
+    cache.flexkv_connector.lookup_kv.return_value = (18, remaining_hit)
+    cache.flexkv_connector.retrieve_kv.return_value = remaining_hit
+    cache.flexkv_connector.start_load_kv_layerwise.return_value = (remaining_hit, 0)
+
+    restored, last_node = cache.init_load_back(
+        InitLoadBackParams(
+            best_match_node=match.best_match_node,
+            host_hit_length=match.host_hit_length,
+            req=req,
+        )
+    )
+
+    assert restored.numel() == 0
+    assert last_node is req.last_node
+    assert allocator.alloc.call_count == 1
+    allocator.free.assert_not_called()
+    cache.flexkv_connector.retrieve_kv.assert_not_called()
+    cache.flexkv_connector.start_load_kv_layerwise.assert_not_called()
+    assert cache.flexkv_connector.release_pending.call_args_list == [
+        call(req.cache_request_key),
+        call(req.cache_request_key),
+    ]
+    assert cache._restore_leases == {}
+    assert req.cache_request_key not in cache._load_markers
+    match = RadixCache.match_prefix(cache, MatchPrefixParams(key=key))
+    assert torch.equal(match.device_indices, reused)
+    assert match.last_device_node is reused_node
+
+
+@pytest.mark.parametrize("input_budget", [8, 16])
+def test_short_mp_restore_replans_prefill_admission(input_budget):
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+    from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+    from sglang.srt.runtime_context import get_context
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    with get_context().override_server_args():
+        cache, allocator = _make_cache()
+        cache._mode = cache.match_prefix.__globals__["FlexKVMode"].MP
+        allocator.page_size = cache.page_size
+        allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+            PrefillBudget(allocator, tree_cache, **kwargs)
+        )
+        cache.flexkv_connector.lookup_kv.return_value = (17, 8)
+        cache.flexkv_connector.retrieve_kv.return_value = 4
+        req = Req(
+            rid="short-mp",
+            origin_input_text="",
+            origin_input_ids=array("q", range(12)),
+            sampling_params=SamplingParams(max_new_tokens=16),
+        )
+        req.init_next_round_input(cache)
+        adder = PrefillAdder(
+            page_size=cache.page_size,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=SimpleNamespace(reqs=[]),
+            new_token_ratio=1.0,
+            rem_input_tokens=input_budget,
+            rem_chunk_tokens=None,
+        )
+        if input_budget == 8:
+            adder.can_run_list.append(object())
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        assert req.host_loaded_length == 0
+        assert req.prefix_indices.numel() == 0
+        assert cache.root_node.children == {}
+        assert cache._restore_leases == {}
+        assert torch.equal(allocator.free.call_args.args[0], torch.arange(100, 108))
+        cache.flexkv_connector.retrieve_kv.assert_called_once()
+        if input_budget == 8:
+            assert result is AddReqResult.OTHER
+            assert req not in adder.can_run_list
+        else:
+            assert adder.can_run_list == [req]
+            assert req.extend_range.length == 12
 
 
 def test_ip_match_is_lookup_only_until_request_admission():

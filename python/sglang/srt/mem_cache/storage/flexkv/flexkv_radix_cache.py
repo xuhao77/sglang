@@ -481,6 +481,10 @@ class FlexKVRadixCache(RadixCache):
         populate part or all of the same prefix before this method runs. Refresh
         the device match before launching H2D to avoid overwriting a live child
         while leaving the old node in ``evictable_leaves``.
+
+        Return the entire promised suffix or None so admission can recompute.
+        Tree-owned reused slots survive a fallback; fresh synchronous slots do
+        not. An incomplete asynchronous transfer must retain its lease and fail.
         """
         if uncached_len <= 0:
             return None
@@ -488,8 +492,9 @@ class FlexKVRadixCache(RadixCache):
             raise RuntimeError(f"FlexKV duplicate load-back: rid={tracking_rid}")
 
         original_value_numel = value_numel
-        target_end = min(value_numel + uncached_len, len(key))
-        uncached_len = target_end - value_numel
+        target_end = value_numel + uncached_len
+        if target_end > len(key):
+            return None
         target_key = key[:target_end]
         refreshed = super().match_prefix(MatchPrefixParams(key=target_key))
         refreshed_indices = refreshed.device_indices
@@ -527,11 +532,10 @@ class FlexKVRadixCache(RadixCache):
                 rid=tracking_rid,
                 sglang_req_id=sglang_req_id,
             )
-            uncached_len = min(uncached_len, target_end - refreshed_len)
+            if uncached_len != target_end - refreshed_len:
+                return None
             value_numel = refreshed_len
             last_node = refreshed.last_device_node
-            if uncached_len <= 0:
-                return reused_indices, last_node
         else:
             last_node = refreshed.last_device_node
 
@@ -540,7 +544,7 @@ class FlexKVRadixCache(RadixCache):
             self.evict(EvictParams(num_tokens=uncached_len))
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None:
-            return (reused_indices, last_node) if reused_indices.numel() > 0 else None
+            return None
 
         # The FlexKV ``launch`` interface takes the slot indices for the
         # tokens it will write — no leading ``-1`` padding (FlexKV has
@@ -567,7 +571,7 @@ class FlexKVRadixCache(RadixCache):
             self.token_to_kv_pool_allocator.free(token_slots)
             if request_owned_req is not None:
                 self._commit_restore(request_owned_req)
-            return (reused_indices, last_node) if reused_indices.numel() > 0 else None
+            return None
 
         if request_owned_req is not None and num_retrieved != uncached_len:
             # The count is not a DMA completion fence. A partial result cannot
@@ -580,13 +584,10 @@ class FlexKVRadixCache(RadixCache):
                 f"requested={uncached_len}; slots cannot be proven idle"
             )
 
-        # Free the tail of the over-allocation when FlexKV returned
-        # fewer than expected. MP retrieval has completed before returning.
-        if num_retrieved < uncached_len:
-            self.token_to_kv_pool_allocator.free(token_slots[num_retrieved:])
-            fetched_slots = token_slots[:num_retrieved]
-        else:
-            fetched_slots = token_slots
+        if num_retrieved != uncached_len:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            return None
+        fetched_slots = token_slots
 
         if request_owned_req is not None:
             if self._defer_duplicate_restores:
