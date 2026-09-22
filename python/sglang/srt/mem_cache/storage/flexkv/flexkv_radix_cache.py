@@ -44,6 +44,7 @@ from flexkv.integration.sglang.connector import (
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
+    CacheRequestOutcome,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
@@ -253,6 +254,11 @@ class FlexKVRadixCache(RadixCache):
     # match_prefix
     # ------------------------------------------------------------------
 
+    def _release_load_marker(self, handle: CacheRequestHandle) -> None:
+        rid = request_key(handle)
+        if self._load_markers.pop(rid, None) is not None:
+            self.flexkv_connector.release_pending(rid)
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
         """Look up the longest cached prefix on host KV (FlexKV).
 
@@ -260,12 +266,14 @@ class FlexKVRadixCache(RadixCache):
         depending on whether layerwise transfer is enabled.
         """
         key = params.key
-        if self.disable or not key:
-            return super().match_prefix(params)
         if params.req is not None and self.has_uncommitted_restore(params.req):
             raise RuntimeError(
                 f"FlexKV prefix rematch before restore commit: rid={params.req.rid}"
             )
+        if params.req is not None:
+            self._release_load_marker(params.req.cache_request_handle)
+        if self.disable or not key:
+            return super().match_prefix(params)
 
         # FlexKV operates at page granularity — round the lookup query
         # down to a multiple of ``page_size`` so the hit count we report
@@ -728,6 +736,7 @@ class FlexKVRadixCache(RadixCache):
             )
         super().cache_finished_req(req, is_insert=is_insert, owned_kv_len=owned_kv_len)
         self._commit_restore(req)
+        self._release_load_marker(req.cache_request_handle)
         # Late cleanup of an aborted Req must not release a new producer
         # that reused its rid while the old allocation was retained.
         if not self.has_uncommitted_restore(req):
@@ -735,7 +744,6 @@ class FlexKVRadixCache(RadixCache):
         if hasattr(req, "_flexkv_restore_tree_owned_len"):
             del req._flexkv_restore_tree_owned_len
         if not is_insert:
-            self._load_markers.pop(rid, None)
             return
 
         # Compute the committed prefix mirroring LMCRadixCache's logic.
@@ -1003,6 +1011,11 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
     # Optional pass-throughs used by the scheduler
     # ------------------------------------------------------------------
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        if outcome == CacheRequestOutcome.SUCCESS:
+            self._release_load_marker(handle)
+        super().finish(handle, outcome)
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         """Release admission tracking without polling launched transfers."""

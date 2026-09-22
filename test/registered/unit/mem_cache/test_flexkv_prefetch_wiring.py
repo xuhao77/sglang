@@ -1,15 +1,23 @@
-"""FlexKV wait-complete prefetch wiring (minimal scheduler surface)."""
+"""FlexKV prefetch wiring and pending lookup lifecycle."""
 
 import importlib.util
 import sys
+from array import array
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+    InsertParams,
+    MatchPrefixParams,
+)
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
 from sglang.srt.mem_cache.storage.flexkv.utils import request_key
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -36,6 +44,102 @@ def _load_flexkv_module(module_filename: str, module_name: str):
     with patch.dict(sys.modules, {connector_name: connector_stub}):
         spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(
+    params=[
+        ("flexkv_radix_cache.py", "FlexKVRadixCache"),
+        ("flexkv_hybrid_radix_cache.py", "FlexKVHybridRadixCache"),
+    ]
+)
+def lookup_cache(request):
+    module_filename, class_name = request.param
+    module = _load_flexkv_module(module_filename, f"_flexkv_lookup_ut_{class_name}")
+    cache_class = getattr(module, class_name)
+    inner = RadixCache.create_simulated(page_size=4)
+    if class_name == "FlexKVRadixCache":
+        cache = inner
+        cache.__class__ = cache_class
+        cache._mode = module.FlexKVMode.MP
+        cache._restore_prefix_by_rid = {}
+    else:
+        cache = cache_class.__new__(cache_class)
+        cache._inner_cache = inner
+        cache.page_size = inner.page_size
+        cache.disable = False
+    cache.flexkv_connector = MagicMock()
+    cache._load_markers = {}
+    cache._restore_leases = {}
+    cache._aborted_restore_leases = {}
+    return cache
+
+
+@pytest.mark.parametrize(
+    "rematch", ["device_hit", "host_miss", "empty", "disabled", "host_hit"]
+)
+def test_rematch_releases_the_previous_host_lookup(lookup_cache, rematch):
+    cache = lookup_cache
+    req = SimpleNamespace(
+        rid="waiting", cache_request_handle=CacheRequestHandle("waiting", 0)
+    )
+    rid = request_key(req.cache_request_handle)
+    key = RadixKey(array("q", range(8)))
+    cache.flexkv_connector.lookup_kv.return_value = (17, 8)
+    first_match = cache.match_prefix(MatchPrefixParams(key=key, req=req))
+    assert first_match.host_hit_length == 8
+    previous_marker = cache._load_markers[rid]
+    cache.flexkv_connector.release_pending.assert_not_called()
+    if rematch == "device_hit":
+        inner = getattr(cache, "_inner_cache", cache)
+        inner.insert(InsertParams(key=key, value=torch.arange(100, 108)))
+    elif rematch == "host_miss":
+        cache.flexkv_connector.lookup_kv.return_value = (-1, 0)
+    elif rematch == "empty":
+        key = RadixKey(array("q"))
+    elif rematch == "disabled":
+        cache.disable = True
+    else:
+        cache.flexkv_connector.lookup_kv.return_value = (18, 4)
+
+    result = cache.match_prefix(MatchPrefixParams(key=key, req=req))
+
+    cache.flexkv_connector.release_pending.assert_called_once_with(rid)
+    if rematch == "host_hit":
+        assert result.host_hit_length == 4
+        assert cache._load_markers[rid] is not previous_marker
+    else:
+        assert result.host_hit_length == 0
+        assert rid not in cache._load_markers
+
+
+@pytest.mark.parametrize("completion", ["finish", "cache_finished"])
+def test_completion_releases_only_its_unused_lookup(lookup_cache, completion):
+    cache = lookup_cache
+    req = SimpleNamespace(
+        rid="finished",
+        cache_request_handle=CacheRequestHandle("finished", 0),
+        origin_input_ids=array("q", range(8)),
+        output_ids=array("q"),
+    )
+    rid = request_key(req.cache_request_handle)
+    other_rid = request_key(CacheRequestHandle(req.rid, 1))
+    cache.flexkv_connector.lookup_kv.return_value = (17, 8)
+    cache.match_prefix(MatchPrefixParams(key=RadixKey(req.origin_input_ids), req=req))
+    other_marker = object()
+    cache._load_markers[other_rid] = other_marker
+    store_node = object()
+    cache._inflight_store_nodes = {rid: store_node}
+
+    if completion == "finish":
+        cache.finish(req.cache_request_handle, CacheRequestOutcome.SUCCESS)
+    else:
+        with patch.object(RadixCache, "cache_finished_req"):
+            cache.cache_finished_req(req, is_insert=False, owned_kv_len=8)
+
+    cache.flexkv_connector.release_pending.assert_called_once_with(rid)
+    assert cache._load_markers == {other_rid: other_marker}
+    assert cache._inflight_store_nodes == {rid: store_node}
+    cache.flexkv_connector.cancel_prefetch.assert_not_called()
 
 
 def test_scheduler_flexkv_prefetch_is_one_liner_to_tree_cache():

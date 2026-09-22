@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
+    CacheRequestOutcome,
     DecLockRefParams,
     EvictParams,
     EvictResult,
@@ -192,11 +193,18 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # Prefer token_to_kv_pool_host.destroy() (HiCache path); keep this alias.
         self.token_to_kv_pool_host.destroy()
 
+    def _release_load_marker(self, handle: CacheRequestHandle) -> None:
+        rid = request_key(handle)
+        if self._load_markers.pop(rid, None) is not None:
+            self.flexkv_connector.release_pending(rid)
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         if params.req is not None and self.has_uncommitted_restore(params.req):
             raise RuntimeError(
                 f"FlexKV prefix rematch before restore commit: rid={params.req.rid}"
             )
+        if params.req is not None:
+            self._release_load_marker(params.req.cache_request_handle)
         result = self._inner_cache.match_prefix(params)
         if self.disable or params.req is None:
             return result
@@ -484,6 +492,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             req, is_insert=is_insert, owned_kv_len=owned_kv_len, **kwargs
         )
         self._commit_restore(req)
+        self._release_load_marker(req.cache_request_handle)
         if not is_insert:
             return
 
@@ -733,6 +742,11 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 if tracked is not None:
                     node, dec_params = tracked
                     self._inner_cache.dec_lock_ref(node, dec_params)
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        if outcome == CacheRequestOutcome.SUCCESS:
+            self._release_load_marker(handle)
+        super().finish(handle, outcome)
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
         rid = request_key(handle)

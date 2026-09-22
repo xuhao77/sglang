@@ -333,6 +333,7 @@ def test_finished_release_commits_restore_lease_after_inner_cache():
     cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
     cache._inner_cache = inner
     cache._aborted_restore_leases = {}
+    cache._load_markers = {}
     cache._restore_leases = {
         _REQUEST_KEY: SimpleNamespace(
             generation=3,
