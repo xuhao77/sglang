@@ -13,6 +13,7 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
+    InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -383,6 +384,7 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
     req = _TestReq(
         rid="request",
         extra_key=None,
+        cache_salt=None,
         kv=SimpleNamespace(swa_evicted_seqlen=0),
         get_fill_ids=lambda: array("q", [1, 2, 3, 4]),
     )
@@ -404,6 +406,44 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
         "request:flexkv-store:0": (node, dec_params),
         "request:flexkv-store:1": (node, dec_params),
     }
+
+
+@pytest.mark.parametrize(
+    "cache_salt, seed_unsalted_prefix",
+    [(None, False), ("tenant", False), ("tenant", True)],
+)
+def test_store_prefix_uses_request_cache_salt(cache_salt, seed_unsalted_prefix):
+    inner = RadixCache.create_simulated(page_size=4)
+    token_ids = array("q", range(8))
+    extra_key = "adapter"
+    if seed_unsalted_prefix:
+        inner.insert(
+            InsertParams(
+                key=RadixKey(token_ids, extra_key=extra_key),
+                value=torch.arange(100, 108),
+            )
+        )
+    expected_indices = torch.arange(200, 208)
+    key = RadixKey(token_ids, extra_key=extra_key, cache_salt=cache_salt)
+    inner.insert(InsertParams(key=key, value=expected_indices))
+    expected_node = inner.match_prefix(MatchPrefixParams(key=key)).last_device_node
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = inner
+    cache.page_size = inner.page_size
+    cache._node_lock = threading.Lock()
+    cache._store_generation = 0
+    cache._async_store_slot_mapping = True
+    cache._pending_store_launches = {}
+    req = _TestReq(rid="request", extra_key=extra_key, cache_salt=cache_salt)
+
+    cache._store_prefix(req, token_ids)
+
+    assert len(cache._pending_store_launches) == 1
+    pending = next(iter(cache._pending_store_launches.values()))
+    assert pending.token_ids == list(token_ids)
+    assert torch.equal(pending.kv_indices, expected_indices)
+    assert pending.node is expected_node
+    assert expected_node.lock_ref == 1
 
 
 def test_reset_drains_flexkv_before_releasing_inner_slots():

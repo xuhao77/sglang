@@ -547,6 +547,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             array("q", token_ids),
             req.extra_key,
             is_bigram=bool(getattr(self._inner_cache, "is_eagle", False)),
+            cache_salt=req.cache_salt,
         )
         match = self._inner_cache.match_prefix(MatchPrefixParams(key=key))
         node = match.last_device_node
