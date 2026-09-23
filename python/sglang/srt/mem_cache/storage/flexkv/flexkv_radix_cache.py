@@ -52,6 +52,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.storage.flexkv.namespace import (
+    NamespacedFlexKVConnector,
+    cache_namespace,
+)
 from sglang.srt.mem_cache.storage.flexkv.utils import request_key
 from sglang.srt.runtime_context import get_spec
 
@@ -107,6 +111,7 @@ class _PendingStoreLaunch:
     token_ids: list[int]
     kv_indices: torch.Tensor
     sglang_req_id: str
+    namespace: Optional[list[str]] = None
 
 
 @dataclass
@@ -119,6 +124,7 @@ class _PendingStoreCopy:
     sglang_req_id: str
     cpu_indices: Optional[torch.Tensor]
     ready_event: Optional[torch.cuda.Event]
+    namespace: Optional[list[str]] = None
 
 
 class FlexKVRadixCache(RadixCache):
@@ -160,6 +166,8 @@ class FlexKVRadixCache(RadixCache):
             attn_tp_group=attn_tp_group_eff,
             attn_cp_group=attn_cp_group,
         )
+
+        self.flexkv_connector = NamespacedFlexKVConnector(self.flexkv_connector)
 
         self._mode = (
             FlexKVMode.IP if self.flexkv_connector.enable_layerwise else FlexKVMode.MP
@@ -327,6 +335,7 @@ class FlexKVRadixCache(RadixCache):
             token_mask=token_mask,
             rid=request_key(req.cache_request_handle),
             sglang_req_id=req.rid,
+            namespace=cache_namespace(key.extra_key, key.cache_salt),
         )
         if hit <= 0:
             return base_res
@@ -542,6 +551,7 @@ class FlexKVRadixCache(RadixCache):
                 token_mask=token_mask,
                 rid=tracking_rid,
                 sglang_req_id=sglang_req_id,
+                namespace=cache_namespace(key.extra_key, key.cache_salt),
             )
             if uncached_len != target_end - refreshed_len:
                 return None
@@ -806,12 +816,17 @@ class FlexKVRadixCache(RadixCache):
                     token_ids=list(token_ids),
                     kv_indices=kv_indices,
                     sglang_req_id=req.rid,
+                    namespace=cache_namespace(req.extra_key, req.cache_salt),
                 )
             return
 
         try:
             fkv_task_id = self._launch_store(
-                rid, list(token_ids), kv_indices, sglang_req_id=req.rid
+                rid,
+                list(token_ids),
+                kv_indices,
+                sglang_req_id=req.rid,
+                namespace=cache_namespace(req.extra_key, req.cache_salt),
             )
         except Exception:  # noqa: BLE001
             self.dec_lock_ref(new_last_node)
@@ -833,6 +848,7 @@ class FlexKVRadixCache(RadixCache):
         kv_indices: torch.Tensor,
         *,
         sglang_req_id: str,
+        namespace: Optional[list[str]] = None,
         mapping_already_on_cpu: bool = False,
         skip_mapping_validation: bool = False,
     ) -> int:
@@ -866,6 +882,7 @@ class FlexKVRadixCache(RadixCache):
                     token_ids=token_ids,
                     kv_indices=kv_indices,
                     sglang_req_id=sglang_req_id,
+                    namespace=namespace,
                 )
 
     def _store_profile_scope(self, name: str):
@@ -897,6 +914,7 @@ class FlexKVRadixCache(RadixCache):
             sglang_req_id=pending.sglang_req_id,
             cpu_indices=cpu_indices,
             ready_event=ready_event,
+            namespace=pending.namespace,
         )
 
     def _launch_ready_store_copies(self) -> None:
@@ -926,6 +944,7 @@ class FlexKVRadixCache(RadixCache):
                         pending.token_ids,
                         store_indices,
                         sglang_req_id=pending.sglang_req_id,
+                        namespace=pending.namespace,
                         mapping_already_on_cpu=pending.cpu_indices is not None,
                         skip_mapping_validation=pending.cpu_indices is None,
                     )
@@ -1062,7 +1081,12 @@ class FlexKVRadixCache(RadixCache):
             return
         match_end = req._compute_max_prefix_len(len(fill_ids))
         tokens = fill_ids[:match_end]
-        self.prefetch_from_storage(req.cache_request_handle, None, tokens)
+        self.prefetch_from_storage(
+            req.cache_request_handle,
+            None,
+            tokens,
+            namespace=cache_namespace(req.extra_key, req.cache_salt),
+        )
 
     def prefetch_from_storage(
         self,
@@ -1071,6 +1095,8 @@ class FlexKVRadixCache(RadixCache):
         token_ids=None,
         last_hash=None,
         prefix_keys=None,
+        *,
+        namespace: Optional[list[str]] = None,
     ) -> None:
         """Kick off FlexKV prefetch (SSD/Remote/Mooncake → CPU).
 
@@ -1088,7 +1114,7 @@ class FlexKVRadixCache(RadixCache):
             return
         try:
             self.flexkv_connector.prefetch_async(
-                request_key(handle), ids, sglang_req_id=handle.rid
+                request_key(handle), ids, sglang_req_id=handle.rid, namespace=namespace
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] prefetch_from_storage: %s", exc)

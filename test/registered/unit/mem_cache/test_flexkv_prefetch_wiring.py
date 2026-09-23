@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
 from sglang.srt.mem_cache.storage.flexkv.utils import request_key
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -72,6 +73,24 @@ def lookup_cache(request):
     cache._restore_leases = {}
     cache._aborted_restore_leases = {}
     return cache
+
+
+@pytest.mark.parametrize(
+    "extra_key, cache_salt", [(None, None), (None, "tenant"), ("adapter", "tenant")]
+)
+def test_lookup_preserves_storage_namespace(lookup_cache, extra_key, cache_salt):
+    req = SimpleNamespace(
+        rid="request", cache_request_handle=CacheRequestHandle("request", 0)
+    )
+    key = RadixKey(array("q", range(8)), extra_key=extra_key, cache_salt=cache_salt)
+    lookup_cache.flexkv_connector.lookup_kv.return_value = (-1, 0)
+
+    lookup_cache.match_prefix(MatchPrefixParams(key=key, req=req))
+
+    seed = storage_namespace_seed(extra_key, cache_salt)
+    assert lookup_cache.flexkv_connector.lookup_kv.call_args.kwargs["namespace"] == (
+        [seed] if seed is not None else None
+    )
 
 
 @pytest.mark.parametrize(
@@ -193,7 +212,10 @@ def test_scheduler_flexkv_prefetch_is_one_liner_to_tree_cache():
         ("flexkv_hybrid_radix_cache.py", "FlexKVHybridRadixCache"),
     ],
 )
-def test_flexkv_prefetch_request_page_aligns_and_launches(module_filename, class_name):
+@pytest.mark.parametrize("cache_salt", [None, "tenant"])
+def test_flexkv_prefetch_request_page_aligns_and_launches(
+    module_filename, class_name, cache_salt
+):
     module = _load_flexkv_module(
         module_filename, f"_flexkv_prefetch_request_ut_{class_name}"
     )
@@ -205,6 +227,8 @@ def test_flexkv_prefetch_request_page_aligns_and_launches(module_filename, class
 
     req = MagicMock()
     req.rid = "r1"
+    req.extra_key = None
+    req.cache_salt = cache_salt
     req.cache_request_handle = CacheRequestHandle("r1", 2)
     req.full_untruncated_fill_ids = [1, 2, 3, 4, 5]
     req._compute_max_prefix_len = MagicMock(return_value=4)
@@ -213,9 +237,11 @@ def test_flexkv_prefetch_request_page_aligns_and_launches(module_filename, class
     cache.prefetch_request(req)
 
     req.init_next_round_input.assert_called_once_with(tree_cache=None, cow_mamba=False)
-    args, _kwargs = cache.flexkv_connector.prefetch_async.call_args
+    args, kwargs = cache.flexkv_connector.prefetch_async.call_args
     assert args[0] == request_key(req.cache_request_handle)
     assert list(args[1]) == [1, 2, 3, 4]
+    seed = storage_namespace_seed(req.extra_key, cache_salt)
+    assert kwargs["namespace"] == ([seed] if seed is not None else None)
 
 
 def test_scheduler_wait_gate_uses_existing_or_condition():

@@ -8,6 +8,12 @@ Remote offload). Same integration pattern as
 `FlexKVConnector` façade talks to `KVManager`, `KVTPClient`, and a
 3-axis (PP × CP × TP) sync context.
 
+`cache_salt` and `extra_key` also partition FlexKV lookups, stores, and
+prefetches through its native `namespace` API. Both radix cache implementations
+preserve this identity across deferred stores; token IDs and GPU slot mappings
+are unchanged. Clear existing FlexKV cache entries when upgrading from a version
+without namespace isolation.
+
 ---
 
 ## Quick start (single H20, single GPU, Qwen3-8B)

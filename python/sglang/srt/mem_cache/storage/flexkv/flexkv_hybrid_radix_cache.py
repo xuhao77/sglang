@@ -33,6 +33,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.flexkv.namespace import (
+    NamespacedFlexKVConnector,
+    cache_namespace,
+)
 from sglang.srt.mem_cache.storage.flexkv.utils import request_key
 
 if TYPE_CHECKING:
@@ -65,6 +69,7 @@ class _PendingStoreLaunch:
     dec_params: DecLockRefParams
     token_ids: list[int]
     kv_indices: torch.Tensor
+    namespace: Optional[list[str]] = None
 
 
 @dataclass
@@ -134,6 +139,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             attn_tp_group=attn_tp_group if attn_tp_group is not None else tp_group,
             attn_cp_group=attn_cp_group,
         )
+        self.flexkv_connector = NamespacedFlexKVConnector(self.flexkv_connector)
         if self.flexkv_connector.enable_layerwise:
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
 
@@ -226,6 +232,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             token_mask,
             rid=rid,
             sglang_req_id=params.req.rid,
+            namespace=cache_namespace(key.extra_key, key.cache_salt),
         )
         if hit_length <= 0:
             return result
@@ -570,6 +577,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             dec_params=lock_result.to_dec_params(),
             token_ids=token_ids,
             kv_indices=indices,
+            namespace=cache_namespace(req.extra_key, req.cache_salt),
         )
         if self.__dict__.get("_async_store_slot_mapping", False):
             with self._node_lock:
@@ -627,6 +635,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                     pending.token_ids,
                     indices,
                     sglang_req_id=pending.sglang_req_id,
+                    namespace=pending.namespace,
                 )
 
     def _store_profile_scope(self, name: str):
@@ -774,7 +783,12 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         if not fill_ids:
             return
         match_end = req._compute_max_prefix_len(len(fill_ids))
-        self.prefetch_from_storage(req.cache_request_handle, None, fill_ids[:match_end])
+        self.prefetch_from_storage(
+            req.cache_request_handle,
+            None,
+            fill_ids[:match_end],
+            namespace=cache_namespace(req.extra_key, req.cache_salt),
+        )
 
     def prefetch_from_storage(
         self,
@@ -783,6 +797,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         token_ids=None,
         last_hash=None,
         prefix_keys=None,
+        *,
+        namespace: Optional[list[str]] = None,
     ) -> None:
         del last_host_node, last_hash, prefix_keys
         if not token_ids:
@@ -794,7 +810,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         if not ids:
             return
         self.flexkv_connector.prefetch_async(
-            request_key(handle), ids, sglang_req_id=handle.rid
+            request_key(handle), ids, sglang_req_id=handle.rid, namespace=namespace
         )
 
     def check_prefetch_progress(self, handle: CacheRequestHandle) -> bool:

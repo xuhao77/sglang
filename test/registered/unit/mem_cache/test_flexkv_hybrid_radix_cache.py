@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.storage.flexkv.utils import request_key
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -443,7 +444,19 @@ def test_store_prefix_uses_request_cache_salt(cache_salt, seed_unsalted_prefix):
     assert pending.token_ids == list(token_ids)
     assert torch.equal(pending.kv_indices, expected_indices)
     assert pending.node is expected_node
+    assert pending.namespace == [storage_namespace_seed(extra_key, cache_salt)]
     assert expected_node.lock_ref == 1
+
+    req.cache_salt = "changed-after-enqueue"
+    cache.flexkv_connector = MagicMock()
+    with patch("torch.cuda.stream", side_effect=lambda _stream: nullcontext()):
+        cache._launch_store(
+            pending, mapping_already_on_cpu=True, skip_mapping_validation=True
+        )
+    assert (
+        cache.flexkv_connector.store_kv.call_args.kwargs["namespace"]
+        == pending.namespace
+    )
 
 
 def test_reset_drains_flexkv_before_releasing_inner_slots():

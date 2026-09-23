@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.storage.flexkv.utils import request_key
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -281,10 +282,11 @@ def test_short_mp_restore_discards_all_fresh_slots():
     assert cache.evictable_size() == 0
 
 
-def test_partial_duplicate_restore_relooks_up_only_missing_suffix():
+@pytest.mark.parametrize("cache_salt", [None, "tenant"])
+def test_partial_duplicate_restore_relooks_up_only_missing_suffix(cache_salt):
     cache, _allocator = _make_cache()
-    first_page = RadixKey(array("q", range(4)))
-    full_key = RadixKey(array("q", range(8)))
+    first_page = RadixKey(array("q", range(4)), cache_salt=cache_salt)
+    full_key = RadixKey(array("q", range(8)), cache_salt=cache_salt)
 
     (first_indices, _first_node), _ = _load(cache, first_page, 0, 4, "first")
     cache.flexkv_connector.lookup_kv.return_value = (17, 4)
@@ -294,6 +296,8 @@ def test_partial_duplicate_restore_relooks_up_only_missing_suffix():
     lookup = cache.flexkv_connector.lookup_kv.call_args
     assert lookup.kwargs["token_ids"] == full_key.raw_token_ids()
     assert lookup.kwargs["token_mask"].tolist() == [False] * 4 + [True] * 4
+    seed = storage_namespace_seed(None, cache_salt)
+    assert lookup.kwargs["namespace"] == ([seed] if seed is not None else None)
     assert second_load.call_args.args[0].numel() == 4
     assert torch.equal(restored_indices[:4], first_indices)
     assert restored_indices.numel() == 8
@@ -514,7 +518,8 @@ def test_finished_request_restores_tree_owned_boundary_before_duplicate_cleanup(
     assert not hasattr(req, "_flexkv_restore_tree_owned_len")
 
 
-def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared():
+@pytest.mark.parametrize("cache_salt", [None, "tenant"])
+def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared(cache_salt):
     cache, allocator = _make_cache(page_size=4)
     request_row = torch.tensor([[4, 5, 6, 7]], dtype=torch.int64)
     cache.req_to_token_pool = SimpleNamespace(req_to_token=request_row)
@@ -534,7 +539,7 @@ def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared():
             cache_protected_len=0,
         ),
         extra_key=None,
-        cache_salt=None,
+        cache_salt=cache_salt,
         last_node=cache.root_node,
         _flexkv_uncached_restore=False,
     )
@@ -558,10 +563,13 @@ def test_finished_store_uses_radix_owned_slots_after_request_row_is_cleared():
     assert stored["sglang_req_id"] == req.rid
     assert stored["token_ids"] == [1, 2, 3, 4]
     assert stored["kv_indices"].tolist() == [4, 5, 6, 7]
+    seed = storage_namespace_seed(req.extra_key, cache_salt)
+    assert stored["namespace"] == ([seed] if seed is not None else None)
     cache.store_stream.wait_stream.assert_called_once_with(producer_stream)
 
 
-def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
+@pytest.mark.parametrize("cache_salt", [None, "tenant"])
+def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping(cache_salt):
     cache, allocator = _make_cache(page_size=4)
     cache._async_store_slot_mapping = True
     request_row = torch.tensor([[4, 5, 6, 7]], dtype=torch.int64)
@@ -580,6 +588,7 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
             sglang_req_id=pending.sglang_req_id,
             cpu_indices=cpu_mapping,
             ready_event=ready_event,
+            namespace=pending.namespace,
         )
 
     req = _TestReq(
@@ -592,7 +601,7 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
             cache_protected_len=0,
         ),
         extra_key=None,
-        cache_salt=None,
+        cache_salt=cache_salt,
         last_node=cache.root_node,
         _flexkv_uncached_restore=False,
     )
@@ -608,6 +617,7 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
         ),
     ):
         cache.cache_finished_req(req, owned_kv_len=4)
+        req.cache_salt = "changed-after-enqueue"
         cache.check_hicache_events()
         cache.flexkv_connector.store_kv.assert_not_called()
         assert list(cache._pending_store_copies) == [req.cache_request_key]
@@ -618,6 +628,8 @@ def test_async_store_waits_for_event_then_uses_pinned_cpu_mapping():
     assert stored["rid"] == req.cache_request_key
     assert stored["sglang_req_id"] == req.rid
     assert stored["kv_indices"] is cpu_mapping
+    seed = storage_namespace_seed(req.extra_key, cache_salt)
+    assert stored["namespace"] == ([seed] if seed is not None else None)
     assert cache._pending_store_copies == {}
     assert req.cache_request_key in cache._inflight_store_nodes
     cache.store_stream.wait_stream.assert_not_called()
